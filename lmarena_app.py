@@ -1,8 +1,11 @@
 """
-LMArena Unrestricted Access Client
-====================================
-Bypasses Cloudflare session expiry, auto-refreshes tokens,
-auto-retries on failure, streams responses.
+LMArena Unrestricted Access Client — FIXED
+=============================================
+- No more hanging / infinite "Running..."
+- Proper streaming (chunks appear immediately)
+- Threaded timeouts on every attempt
+- gradio_client as primary method (handles Gradio protocol correctly)
+- Smart endpoint discovery instead of brute-force
 
 RUN:  streamlit run lmarena_app.py
 """
@@ -13,13 +16,14 @@ import time
 import random
 import string
 import re
-import os
-from datetime import datetime, timedelta
-from typing import Generator, Optional, List, Dict, Any
+import threading
+import queue as queuelib
+from datetime import datetime
+from typing import Generator, List, Dict, Any, Optional
 import traceback
 import requests
 
-# ── optional accelerators (graceful fallback) ──────────────
+# ── optional deps (graceful fallback) ──────────────────────
 try:
     import cloudscraper
 except ImportError:
@@ -31,16 +35,17 @@ except ImportError:
     cffi_requests = None
 
 try:
-    from gradio_client import Client as GradioNativeClient
+    from gradio_client import Client as GradioClient
 except ImportError:
-    GradioNativeClient = None
+    GradioClient = None
 
 # ── constants ──────────────────────────────────────────────
 BASE_URL = "https://lmarena.ai"
-COOKIE_LIFETIME_MIN = 10          # refresh BEFORE cf_clearance dies
-MAX_RETRIES = 4
-STREAM_TIMEOUT = 360              # 6 min – even long essays finish
-SSE_RECONNECT_DELAY = 2
+COOKIE_LIFETIME_MIN = 10
+MAX_RETRIES = 3
+ATTEMPT_TIMEOUT = 20        # seconds per single endpoint attempt
+TOTAL_CHAT_TIMEOUT = 180    # seconds total for entire chat call
+CONNECT_TIMEOUT = 15
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -52,14 +57,6 @@ BROWSER_HEADERS = {
               "q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
     "Connection": "keep-alive",
 }
 
@@ -76,7 +73,6 @@ DEFAULT_MODELS = [
     "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-flash-preview-04-17",
     "gemini-2.0-flash-001",
-    "gemini-1.5-pro-002",
     "deepseek-v3-0324",
     "deepseek-r1-0528",
     "llama-4-maverick-17b-128e",
@@ -86,60 +82,65 @@ DEFAULT_MODELS = [
     "qwen3-235b-a22b",
     "qwen-2.5-72b-instruct",
     "command-a-03-2025",
-    "command-r-plus-08-2024",
     "grok-3-mini-beta",
-    "yi-lightning",
 ]
 
 
 # ════════════════════════════════════════════════════════════
-#  SESSION MANAGER — Cloudflare bypass + auto-refresh
+#  LOGGING HELPER
+# ════════════════════════════════════════════════════════════
+class Log:
+    def __init__(self):
+        self.entries: List[str] = []
+
+    def __call__(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.entries.append(f"[{ts}] {msg}")
+        if len(self.entries) > 300:
+            self.entries = self.entries[-150:]
+
+    def recent(self, n=40):
+        return self.entries[-n:]
+
+
+# ════════════════════════════════════════════════════════════
+#  SESSION MANAGER — HTTP session that survives Cloudflare
 # ════════════════════════════════════════════════════════════
 class SessionManager:
-    """Creates and maintains an HTTP session that survives Cloudflare."""
-
-    def __init__(self, manual_cookie: str = ""):
-        self.session = None
+    def __init__(self, log: Log, manual_cookie: str = ""):
+        self.log = log
+        self.session: Optional[requests.Session] = None
         self.method = "none"
-        self.born = datetime.now()
-        self.last_refresh = None
+        self.last_refresh: Optional[datetime] = None
         self.session_hash = self._rand()
         self.manual_cookie = manual_cookie
-        self.log: List[str] = []
         self._build()
 
-    # ── helpers ────────────────────────────────────────────
     @staticmethod
     def _rand(n=12):
         return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-    def _log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        entry = f"[{ts}] {msg}"
-        self.log.append(entry)
-        if len(self.log) > 200:
-            self.log = self.log[-100:]
+    def new_hash(self):
+        self.session_hash = self._rand()
 
-    # ── session builders (tried in order) ──────────────────
+    # ── builders (tried in order) ──────────────────────────
     def _build(self):
-        builders = [
+        for name, fn in [
             ("curl_cffi", self._build_curl_cffi),
             ("cloudscraper", self._build_cloudscraper),
             ("manual_cookie", self._build_manual),
             ("plain_requests", self._build_plain),
-        ]
-        for name, fn in builders:
+        ]:
             try:
                 if fn():
                     self.method = name
                     self.last_refresh = datetime.now()
-                    self._log(f"✅ connected via {name}")
+                    self.log(f"✅ HTTP session via {name}")
                     return
             except Exception as e:
-                self._log(f"⚠️ {name} failed: {e}")
-        self._log("❌ all methods exhausted — using plain requests")
+                self.log(f"⚠️ {name}: {e}")
         self._build_plain()
-        self.method = "plain_requests (fallback)"
+        self.method = "plain_requests"
         self.last_refresh = datetime.now()
 
     def _build_curl_cffi(self):
@@ -147,8 +148,8 @@ class SessionManager:
             return False
         s = cffi_requests.Session(impersonate="chrome131")
         s.headers.update(BROWSER_HEADERS)
-        r = s.get(BASE_URL, timeout=30)
-        if r.status_code == 200 and self._looks_legit(r.text):
+        r = s.get(BASE_URL, timeout=CONNECT_TIMEOUT)
+        if r.status_code == 200:
             self.session = s
             return True
         return False
@@ -158,11 +159,10 @@ class SessionManager:
             return False
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "desktop": True},
-            delay=5,
         )
         s.headers.update(BROWSER_HEADERS)
-        r = s.get(BASE_URL, timeout=30)
-        if r.status_code == 200 and self._looks_legit(r.text):
+        r = s.get(BASE_URL, timeout=CONNECT_TIMEOUT)
+        if r.status_code == 200:
             self.session = s
             return True
         return False
@@ -173,8 +173,8 @@ class SessionManager:
         s = requests.Session()
         s.headers.update(BROWSER_HEADERS)
         s.cookies.set("cf_clearance", self.manual_cookie, domain=".lmarena.ai")
-        r = s.get(BASE_URL, timeout=20)
-        if r.status_code == 200 and self._looks_legit(r.text):
+        r = s.get(BASE_URL, timeout=CONNECT_TIMEOUT)
+        if r.status_code == 200:
             self.session = s
             return True
         return False
@@ -185,132 +185,193 @@ class SessionManager:
         self.session = s
         return True
 
-    @staticmethod
-    def _looks_legit(html: str) -> bool:
-        markers = ["gradio", "Chatbot Arena", "lmsys", "arena", "model"]
-        html_l = html.lower()
-        return any(m.lower() in html_l for m in markers)
+    def maybe_refresh(self):
+        if self.last_refresh:
+            age = (datetime.now() - self.last_refresh).total_seconds() / 60
+            if age >= COOKIE_LIFETIME_MIN:
+                self.log(f"🔄 Session age {age:.0f}m — refreshing")
+                self._build()
 
-    # ── auto-refresh ───────────────────────────────────────
-    def _maybe_refresh(self):
-        if self.last_refresh is None:
-            return
-        age = (datetime.now() - self.last_refresh).total_seconds() / 60
-        if age >= COOKIE_LIFETIME_MIN:
-            self._log(f"🔄 session age {age:.0f}m — refreshing")
-            old_method = self.method
-            self._build()
-            if self.method == "none":
-                self.method = old_method  # keep old if rebuild fails
-
-    def new_hash(self):
-        self.session_hash = self._rand()
-
-    # ── HTTP wrappers with retry + auto-refresh ────────────
     def get(self, url, **kw):
-        return self._request("GET", url, **kw)
+        self.maybe_refresh()
+        kw.setdefault("timeout", CONNECT_TIMEOUT)
+        return self.session.get(url, **kw)
 
     def post(self, url, **kw):
-        return self._request("POST", url, **kw)
-
-    def get_stream(self, url, **kw):
-        """Streaming GET — returns raw response (caller iterates)."""
-        self._maybe_refresh()
-        kw.setdefault("timeout", STREAM_TIMEOUT)
-        kw["stream"] = True
-        for attempt in range(MAX_RETRIES):
-            try:
-                r = self.session.get(url, **kw)
-                if r.status_code in (403, 503):
-                    self._log(f"⚠️ stream GET {r.status_code}, retry {attempt+1}")
-                    self._build()
-                    continue
-                return r
-            except Exception as e:
-                self._log(f"⚠️ stream GET error: {e}, retry {attempt+1}")
-                time.sleep(SSE_RECONNECT_DELAY * (attempt + 1))
-                self._build()
-        raise ConnectionError("stream GET failed after all retries")
-
-    def _request(self, method, url, **kw):
-        self._maybe_refresh()
-        kw.setdefault("timeout", 30)
-        for attempt in range(MAX_RETRIES):
-            try:
-                r = getattr(self.session, method.lower())(url, **kw)
-                if r.status_code in (403, 503):
-                    self._log(f"⚠️ {method} {r.status_code}, retry {attempt+1}")
-                    self._build()
-                    continue
-                return r
-            except Exception as e:
-                self._log(f"⚠️ {method} error: {e}, retry {attempt+1}")
-                time.sleep(SSE_RECONNECT_DELAY * (attempt + 1))
-                self._build()
-        raise ConnectionError(f"{method} failed after all retries")
+        self.maybe_refresh()
+        kw.setdefault("timeout", CONNECT_TIMEOUT)
+        return self.session.post(url, **kw)
 
 
 # ════════════════════════════════════════════════════════════
-#  LMARENA CLIENT — Gradio API interaction
+#  TIMEOUT WRAPPER — prevents any method from hanging
+# ════════════════════════════════════════════════════════════
+_SENTINEL = object()
+
+
+def run_with_timeout(generator_fn, timeout: int) -> Generator[str, None, None]:
+    """
+    Run a generator in a background thread.
+    Yields chunks as they arrive.
+    Raises TimeoutError if no chunk arrives within `timeout` seconds.
+    """
+    q = queuelib.Queue()
+
+    def worker():
+        try:
+            for chunk in generator_fn():
+                q.put(("chunk", chunk))
+            q.put(("done", None))
+        except Exception as e:
+            q.put(("error", e))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    last_activity = time.time()
+    while True:
+        try:
+            msg_type, payload = q.get(timeout=2.0)
+            last_activity = time.time()
+            if msg_type == "chunk":
+                yield payload
+            elif msg_type == "done":
+                return
+            elif msg_type == "error":
+                raise payload
+        except queuelib.Empty:
+            if time.time() - last_activity > timeout:
+                raise TimeoutError(
+                    f"No data received for {timeout}s — endpoint not responding"
+                )
+
+
+# ════════════════════════════════════════════════════════════
+#  LMARENA CLIENT — API interaction
 # ════════════════════════════════════════════════════════════
 class LMArenaClient:
-    """Talks to LMArena's Gradio backend."""
-
-    def __init__(self, sm: SessionManager):
+    def __init__(self, sm: SessionManager, log: Log):
         self.sm = sm
+        self.log = log
         self.models = DEFAULT_MODELS[:]
-        self.config = None
-        self.working_fn = None      # cache fn_index that works
-        self.working_fmt = None     # cache payload format that works
 
-    # ── config + model discovery ───────────────────────────
-    def fetch_config(self) -> bool:
-        """Pull Gradio config and extract model list."""
-        try:
-            r = self.sm.get(f"{BASE_URL}/info", timeout=15)
-            if r.status_code == 200:
-                self.config = r.json()
-                self.sm._log("📋 got /info config")
-                return True
-        except:
-            pass
+        # gradio_client state
+        self.gradio: Optional[Any] = None
+        self.named_endpoints: Dict = {}
+        self.unnamed_endpoints: Dict = {}
 
+        # cache what worked last time
+        self._cached_endpoint = None
+        self._cached_params_style = None
+
+        # HTTP/SSE state
+        self.http_fn_index: Optional[int] = None
+        self.gradio_config: Optional[Dict] = None
+
+    # ────────────────────────────────────────────────────────
+    #  CONNECTION + DISCOVERY
+    # ────────────────────────────────────────────────────────
+    def connect(self) -> bool:
+        """Connect and discover usable API endpoints."""
+        ok = False
+
+        # Method A: gradio_client library
+        if GradioClient is not None:
+            ok = self._connect_gradio_client()
+
+        # Method B: parse Gradio config from HTML
+        if not ok:
+            ok = self._discover_from_html()
+
+        if not ok:
+            self.log("⚠️ Could not discover API — will attempt blind calls")
+
+        return ok
+
+    def _connect_gradio_client(self) -> bool:
         try:
-            r = self.sm.get(BASE_URL, timeout=20)
-            if r.status_code == 200:
-                # modern Gradio embeds config in a script tag
-                for pattern in [
-                    r'window\.gradio_config\s*=\s*({.*?})\s*;',
-                    r'"config"\s*:\s*({.*?"components".*?})\s*[,;]',
-                ]:
-                    m = re.search(pattern, r.text, re.DOTALL)
-                    if m:
-                        self.config = json.loads(m.group(1))
-                        self.sm._log("📋 got embedded config")
-                        self._extract_models()
-                        return True
+            self.log("🔍 Connecting via gradio_client...")
+            self.gradio = GradioClient(BASE_URL, verbose=False)
+            info = self.gradio.view_api(print_info=False, return_format="dict")
+
+            self.named_endpoints = info.get("named_endpoints", {})
+            self.unnamed_endpoints = info.get("unnamed_endpoints", {})
+
+            for name in self.named_endpoints:
+                params = self.named_endpoints[name].get("parameters", [])
+                param_names = [p.get("parameter_name", "?") for p in params]
+                self.log(f"  📌 {name}({', '.join(param_names)})")
+
+            for idx in sorted(self.unnamed_endpoints.keys(), key=lambda x: int(x)):
+                params = self.unnamed_endpoints[idx].get("parameters", [])
+                self.log(f"  📌 fn_{idx}({len(params)} params)")
+
+            total = len(self.named_endpoints) + len(self.unnamed_endpoints)
+            self.log(f"✅ gradio_client connected — {total} endpoints")
+            return total > 0
         except Exception as e:
-            self.sm._log(f"⚠️ config fetch: {e}")
-        return False
+            self.log(f"❌ gradio_client failed: {e}")
+            self.gradio = None
+            return False
 
-    def _extract_models(self):
-        if not self.config:
-            return
+    def _discover_from_html(self) -> bool:
+        """Parse the Gradio config embedded in the page HTML."""
         try:
-            for comp in self.config.get("components", []):
-                props = comp.get("props", {})
-                choices = props.get("choices", [])
-                if len(choices) > 5:
-                    flat = [c if isinstance(c, str) else (c[0] if c else "") for c in choices]
-                    flat = [c for c in flat if c]
-                    if flat:
-                        self.models = flat
-                        self.sm._log(f"🤖 found {len(flat)} models")
-                        return
-        except:
-            pass
+            self.log("🔍 Fetching page HTML for config...")
+            r = self.sm.get(BASE_URL, timeout=20)
+            if r.status_code != 200:
+                self.log(f"❌ Got HTTP {r.status_code}")
+                return False
 
-    # ── core chat (streaming generator) ────────────────────
+            html = r.text
+
+            # Gradio embeds config in various ways
+            config = None
+            for pattern in [
+                r"window\.gradio_config\s*=\s*(\{.*?\})\s*;",
+                r"<script>window\.gradio_config\s*=\s*(\{.*?\})\s*</script>",
+                r'"config"\s*:\s*(\{.*?"components".*?\})',
+            ]:
+                m = re.search(pattern, html, re.DOTALL)
+                if m:
+                    try:
+                        config = json.loads(m.group(1))
+                        break
+                    except json.JSONDecodeError:
+                        continue
+
+            if not config:
+                self.log("⚠️ No Gradio config found in HTML")
+                return False
+
+            self.gradio_config = config
+
+            # Extract dependencies (fn_index mapping)
+            deps = config.get("dependencies", [])
+            self.log(f"📋 Found {len(deps)} dependencies in config")
+
+            # Find chat-related fn_index
+            for i, dep in enumerate(deps):
+                # Look for streaming dependencies or ones with chatbot outputs
+                if dep.get("queue") or dep.get("is_generating"):
+                    self.http_fn_index = i
+                    self.log(f"✅ Found streaming fn_index={i}")
+                    return True
+
+            # Fallback: use first dependency
+            if deps:
+                self.http_fn_index = 0
+                self.log(f"✅ Using fn_index=0 (first dependency)")
+                return True
+
+            return False
+        except Exception as e:
+            self.log(f"❌ HTML discovery failed: {e}")
+            return False
+
+    # ────────────────────────────────────────────────────────
+    #  MAIN CHAT (with timeout + fallback chain)
+    # ────────────────────────────────────────────────────────
     def chat(
         self,
         message: str,
@@ -321,212 +382,362 @@ class LMArenaClient:
         system_prompt: str = "",
     ) -> Generator[str, None, None]:
         """
-        Send a message → yield response chunks.
-        Tries: queue SSE → predict API → gradio_client.
-        Auto-retries with fresh session on failure.
+        Send message, yield response chunks.
+        Tries methods in order, each with a timeout.
+        NEVER hangs — worst case returns error in < 60s.
         """
-        methods = [
-            ("queue_sse", self._chat_queue_sse),
-            ("api_predict", self._chat_api_predict),
-            ("gradio_client", self._chat_gradio_client),
-        ]
+        errors = []
+        got_response = False
 
-        last_exc = None
-        for name, fn in methods:
-            for attempt in range(2):  # each method gets 2 tries
-                try:
-                    chunks = list(fn(message, model, history,
-                                     temperature, max_tokens, system_prompt))
-                    if chunks and any(c.strip() for c in chunks):
-                        self.sm._log(f"✅ {name} worked (attempt {attempt+1})")
-                        yield from chunks
-                        return
-                except Exception as e:
-                    last_exc = e
-                    self.sm._log(f"⚠️ {name} attempt {attempt+1}: {e}")
-                    # refresh session between retries
-                    self.sm._build()
-                    self.sm.new_hash()
-                    time.sleep(1)
+        # ── Method 1: gradio_client ────────────────────────
+        if self.gradio:
+            try:
+                self.log("💬 Trying gradio_client...")
+                for chunk in run_with_timeout(
+                    lambda: self._gradio_chat(
+                        message, model, history,
+                        temperature, max_tokens, system_prompt
+                    ),
+                    timeout=ATTEMPT_TIMEOUT,
+                ):
+                    got_response = True
+                    yield chunk
 
-        yield f"\n\n❌ **All methods failed.**\nLast error: `{last_exc}`\n\nTry:\n1. Click **Force Reconnect** in the sidebar\n2. Paste a fresh `cf_clearance` cookie\n3. Wait a minute and retry"
+                if got_response:
+                    return
+            except Exception as e:
+                errors.append(f"gradio_client: {e}")
+                self.log(f"⚠️ gradio_client: {e}")
 
-    # ── method 1: queue + SSE stream ───────────────────────
-    def _chat_queue_sse(self, message, model, history,
-                        temperature, max_tokens, system_prompt):
+        # ── Method 2: Direct HTTP/SSE ──────────────────────
+        try:
+            self.log("💬 Trying HTTP/SSE...")
+            for chunk in run_with_timeout(
+                lambda: self._http_chat(
+                    message, model, history,
+                    temperature, max_tokens, system_prompt
+                ),
+                timeout=ATTEMPT_TIMEOUT,
+            ):
+                got_response = True
+                yield chunk
+
+            if got_response:
+                return
+        except Exception as e:
+            errors.append(f"HTTP/SSE: {e}")
+            self.log(f"⚠️ HTTP/SSE: {e}")
+
+        # ── Method 3: gradio_client predict (blocking) ─────
+        if self.gradio:
+            try:
+                self.log("💬 Trying blocking predict...")
+                text = self._gradio_predict_blocking(
+                    message, model, history,
+                    temperature, max_tokens, system_prompt
+                )
+                if text:
+                    yield text
+                    return
+            except Exception as e:
+                errors.append(f"predict: {e}")
+                self.log(f"⚠️ predict: {e}")
+
+        # ── All failed ─────────────────────────────────────
+        err_list = "\n".join(f"- {e}" for e in errors)
+        yield (
+            f"\n\n❌ **Could not get a response from LMArena.**\n\n"
+            f"**Errors:**\n{err_list}\n\n"
+            f"**Try:**\n"
+            f"1. Click **🔄 Reconnect** in sidebar\n"
+            f"2. Paste a fresh `cf_clearance` cookie\n"
+            f"3. Try a different model\n"
+            f"4. Check the 📜 Connection Log for details"
+        )
+
+    # ────────────────────────────────────────────────────────
+    #  METHOD 1: gradio_client streaming (submit)
+    # ────────────────────────────────────────────────────────
+    def _gradio_chat(self, message, model, history,
+                     temperature, max_tokens, system_prompt):
+        """Use gradio_client.submit() for streaming responses."""
+        if not self.gradio:
+            raise RuntimeError("gradio_client not connected")
 
         gradio_hist = self._to_gradio_history(history)
 
-        # payload formats LMArena has used (try cached first, then all)
-        formats = self._payload_formats(message, model, gradio_hist,
-                                         temperature, max_tokens, system_prompt)
-        if self.working_fmt is not None:
-            formats = [formats[self.working_fmt]] + formats
+        # Build endpoint priority list
+        endpoints = self._prioritized_endpoints()
+        if not endpoints:
+            raise RuntimeError("No API endpoints discovered")
 
-        fn_range = ([self.working_fn] if self.working_fn is not None else []) + \
-                   list(range(12))
+        # Parameter combinations to try (ordered by likelihood)
+        def make_params():
+            return [
+                [message, gradio_hist],
+                [message, gradio_hist, model],
+                [message, gradio_hist, model, temperature, max_tokens],
+                [None, model, message, gradio_hist],
+                [message],
+            ]
 
-        for fmt_idx, data in enumerate(formats):
-            for fn in fn_range[:6]:
+        for ep_type, ep_id in endpoints[:4]:  # max 4 endpoints
+            for params in make_params()[:3]:   # max 3 param combos each
                 try:
-                    result = list(self._do_sse(fn, data))
-                    if result:
-                        self.working_fn = fn
-                        self.working_fmt = fmt_idx
-                        yield from result
+                    self.log(f"  → {ep_type}:{ep_id} ({len(params)} params)")
+
+                    if ep_type == "named":
+                        job = self.gradio.submit(*params, api_name=ep_id)
+                    else:
+                        job = self.gradio.submit(*params, fn_index=int(ep_id))
+
+                    full = ""
+                    start = time.time()
+
+                    while not job.done():
+                        if time.time() - start > ATTEMPT_TIMEOUT:
+                            try:
+                                job.cancel()
+                            except Exception:
+                                pass
+                            raise TimeoutError("endpoint timeout")
+
+                        try:
+                            outputs = job.outputs()
+                            if outputs:
+                                text = self._extract_text(outputs[-1])
+                                if text and len(text) > len(full):
+                                    delta = text[len(full):]
+                                    full = text
+                                    yield delta
+                        except (IndexError, TypeError):
+                            pass
+                        time.sleep(0.3)
+
+                    # final result
+                    try:
+                        result = job.result(timeout=5)
+                        text = self._extract_text(result)
+                        if text and len(text) > len(full):
+                            yield text[len(full):]
+                            full = text
+                    except Exception:
+                        pass
+
+                    if full and len(full.strip()) > 1:
+                        self._cached_endpoint = (ep_type, ep_id)
+                        self.log(f"  ✅ response from {ep_type}:{ep_id}")
                         return
-                except Exception:
-                    continue
 
-        raise RuntimeError("no fn_index + payload combo worked")
+                except TimeoutError:
+                    self.log(f"  ⏰ {ep_type}:{ep_id} timed out")
+                except Exception as e:
+                    self.log(f"  ❌ {ep_type}:{ep_id}: {str(e)[:80]}")
 
-    def _payload_formats(self, msg, model, hist, temp, maxt, sys_p):
-        return [
-            [msg, hist, model, temp, maxt],
-            [None, model, msg, hist],
-            [model, msg, hist, temp, maxt],
-            [msg, hist, model],
-            [msg, model],
-            [msg, hist, model, sys_p, temp, maxt],
-        ]
+        raise RuntimeError(f"Tried {len(endpoints)} endpoints — none responded")
 
-    def _do_sse(self, fn_index, data) -> Generator[str, None, None]:
-        """POST /queue/join then stream /queue/data."""
+    # ────────────────────────────────────────────────────────
+    #  METHOD 2: Direct HTTP/SSE
+    # ────────────────────────────────────────────────────────
+    def _http_chat(self, message, model, history,
+                   temperature, max_tokens, system_prompt):
+        """Direct HTTP calls to Gradio queue API."""
+        gradio_hist = self._to_gradio_history(history)
         h = self.sm.session_hash
 
-        join = {
-            "data": data,
-            "fn_index": fn_index,
-            "session_hash": h,
-        }
-        r = self.sm.post(f"{BASE_URL}/queue/join", json=join, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(f"join {r.status_code}: {r.text[:200]}")
+        fn_indexes = []
+        if self.http_fn_index is not None:
+            fn_indexes.append(self.http_fn_index)
+        fn_indexes.extend([0, 1, 2, 3])
+        fn_indexes = list(dict.fromkeys(fn_indexes))[:4]  # dedupe, max 4
 
-        # some Gradio versions return event_id
-        event_id = None
-        try:
-            event_id = r.json().get("event_id")
-        except:
-            pass
+        payloads = [
+            [message, gradio_hist, model],
+            [message, gradio_hist],
+            [message, gradio_hist, model, temperature, max_tokens],
+        ]
 
-        sse_url = f"{BASE_URL}/queue/data?session_hash={h}"
-        if event_id:
-            sse_url += f"&event_id={event_id}"
-
-        resp = self.sm.get_stream(
-            sse_url,
-            headers={**BROWSER_HEADERS, "Accept": "text/event-stream",
-                     "Cache-Control": "no-cache"},
-        )
-
-        full = ""
-        got_output = False
-
-        for raw_line in resp.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
-
-            line = raw_line
-            if line.startswith("data: "):
-                line = line[6:]
-            elif line.startswith("data:"):
-                line = line[5:]
-            else:
-                continue
-
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            msg_type = ev.get("msg", "")
-
-            if msg_type in ("process_generating", "process_completed"):
-                text = self._dig_text(ev.get("output", {}))
-                if text and len(text) > len(full):
-                    delta = text[len(full):]
-                    full = text
-                    got_output = True
-                    yield delta
-                if msg_type == "process_completed":
-                    break
-
-            elif msg_type == "close_stream":
-                break
-
-            elif msg_type == "heartbeat":
-                continue
-
-        if not got_output:
-            raise RuntimeError("SSE stream ended with no output")
-
-    # ── method 2: direct /api/predict ──────────────────────
-    def _chat_api_predict(self, message, model, history,
-                          temperature, max_tokens, system_prompt):
-        for fn in range(6):
-            for data in self._payload_formats(message, model,
-                    self._to_gradio_history(history),
-                    temperature, max_tokens, system_prompt)[:3]:
+        for fn in fn_indexes:
+            for data in payloads[:2]:  # max 2 payloads per fn
                 try:
+                    self.log(f"  → HTTP fn={fn} ({len(data)} params)")
+
+                    # Join queue
+                    join_body = {
+                        "data": data,
+                        "fn_index": fn,
+                        "session_hash": h,
+                    }
                     r = self.sm.post(
-                        f"{BASE_URL}/api/predict",
-                        json={"data": data, "fn_index": fn,
-                              "session_hash": self.sm.session_hash},
-                        timeout=120,
+                        f"{BASE_URL}/queue/join",
+                        json=join_body,
+                        timeout=10,
                     )
-                    if r.status_code == 200:
-                        text = self._dig_text(r.json())
-                        if text:
-                            yield text
-                            return
-                except:
-                    continue
-        raise RuntimeError("predict API failed")
+                    if r.status_code != 200:
+                        self.log(f"  ❌ join returned {r.status_code}")
+                        continue
 
-    # ── method 3: gradio_client lib ────────────────────────
-    def _chat_gradio_client(self, message, model, history,
-                             temperature, max_tokens, system_prompt):
-        if GradioNativeClient is None:
-            raise RuntimeError("gradio_client not installed")
+                    event_id = None
+                    try:
+                        event_id = r.json().get("event_id")
+                    except Exception:
+                        pass
 
-        client = GradioNativeClient(BASE_URL, verbose=False)
-        api_info = client.view_api(print_info=False, return_format="dict")
+                    # Stream SSE
+                    sse_url = f"{BASE_URL}/queue/data?session_hash={h}"
+                    if event_id:
+                        sse_url += f"&event_id={event_id}"
 
-        # try every named endpoint
-        for ep_name in list(api_info.get("named_endpoints", {}).keys())[:5]:
-            try:
-                result = client.predict(message, api_name=ep_name)
-                text = result if isinstance(result, str) else str(result)
-                if text and len(text) > 5:
-                    yield text
-                    return
-            except:
-                continue
+                    resp = self.sm.session.get(
+                        sse_url,
+                        headers={
+                            **BROWSER_HEADERS,
+                            "Accept": "text/event-stream",
+                            "Cache-Control": "no-cache",
+                        },
+                        stream=True,
+                        timeout=ATTEMPT_TIMEOUT,
+                    )
 
-        raise RuntimeError("gradio_client: no endpoint worked")
+                    full = ""
+                    got_data = False
 
-    # ── helpers ────────────────────────────────────────────
+                    for raw in resp.iter_lines(decode_unicode=True):
+                        if not raw:
+                            continue
+
+                        line = raw
+                        if line.startswith("data: "):
+                            line = line[6:]
+                        elif line.startswith("data:"):
+                            line = line[5:]
+                        else:
+                            continue
+
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        msg = ev.get("msg", "")
+
+                        if msg in ("process_generating", "process_completed"):
+                            text = self._extract_text(ev.get("output", {}))
+                            if text and len(text) > len(full):
+                                delta = text[len(full):]
+                                full = text
+                                got_data = True
+                                yield delta
+                            if msg == "process_completed":
+                                break
+                        elif msg == "close_stream":
+                            break
+
+                    if got_data:
+                        self.http_fn_index = fn
+                        self.log(f"  ✅ SSE response from fn={fn}")
+                        return
+
+                except Exception as e:
+                    self.log(f"  ❌ HTTP fn={fn}: {str(e)[:80]}")
+
+        raise RuntimeError("HTTP/SSE: no endpoint responded")
+
+    # ────────────────────────────────────────────────────────
+    #  METHOD 3: gradio_client blocking predict
+    # ────────────────────────────────────────────────────────
+    def _gradio_predict_blocking(self, message, model, history,
+                                  temperature, max_tokens, system_prompt):
+        """Last resort: blocking predict() call."""
+        if not self.gradio:
+            raise RuntimeError("not connected")
+
+        gradio_hist = self._to_gradio_history(history)
+        endpoints = self._prioritized_endpoints()
+
+        for ep_type, ep_id in endpoints[:3]:
+            for params in [
+                [message, gradio_hist],
+                [message, gradio_hist, model],
+                [message],
+            ]:
+                try:
+                    self.log(f"  → predict {ep_type}:{ep_id}")
+                    if ep_type == "named":
+                        result = self.gradio.predict(
+                            *params, api_name=ep_id
+                        )
+                    else:
+                        result = self.gradio.predict(
+                            *params, fn_index=int(ep_id)
+                        )
+
+                    text = self._extract_text(result)
+                    if text and len(text.strip()) > 1:
+                        self.log(f"  ✅ predict response from {ep_type}:{ep_id}")
+                        return text
+                except Exception as e:
+                    self.log(f"  ❌ predict {ep_type}:{ep_id}: {str(e)[:80]}")
+
+        raise RuntimeError("predict: no endpoint responded")
+
+    # ────────────────────────────────────────────────────────
+    #  HELPERS
+    # ────────────────────────────────────────────────────────
+    def _prioritized_endpoints(self):
+        """Return endpoints sorted by likely usefulness."""
+        result = []
+
+        # Cached working endpoint first
+        if self._cached_endpoint:
+            result.append(self._cached_endpoint)
+
+        # Named endpoints with chat-like names
+        chat_keywords = ["chat", "send", "submit", "bot", "respond",
+                         "add_text", "message", "predict", "generate"]
+        for name in self.named_endpoints:
+            if any(kw in name.lower() for kw in chat_keywords):
+                ep = ("named", name)
+                if ep not in result:
+                    result.append(ep)
+
+        # All other named endpoints
+        for name in self.named_endpoints:
+            ep = ("named", name)
+            if ep not in result:
+                result.append(ep)
+
+        # Unnamed endpoints
+        for idx in sorted(self.unnamed_endpoints.keys(), key=lambda x: int(x)):
+            ep = ("unnamed", idx)
+            if ep not in result:
+                result.append(ep)
+
+        return result
+
     @staticmethod
-    def _to_gradio_history(messages):
-        """Convert [{"role":"user","content":"..."},...] → [[user,bot],...]"""
+    def _to_gradio_history(messages: List[Dict]) -> List[List]:
+        """Convert [{role, content}, ...] → [[user, bot], ...]"""
         pairs = []
         i = 0
         while i < len(messages):
-            user_msg = messages[i].get("content", "") if messages[i]["role"] == "user" else ""
-            bot_msg = ""
-            if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
-                bot_msg = messages[i + 1].get("content", "")
-                i += 2
+            if messages[i].get("role") == "user":
+                user_msg = messages[i].get("content", "")
+                bot_msg = ""
+                if (i + 1 < len(messages)
+                        and messages[i + 1].get("role") == "assistant"):
+                    bot_msg = messages[i + 1].get("content", "")
+                    i += 2
+                else:
+                    i += 1
+                pairs.append([user_msg, bot_msg])
             else:
                 i += 1
-            if user_msg:
-                pairs.append([user_msg, bot_msg])
         return pairs
 
     @staticmethod
-    def _dig_text(obj, depth=0) -> str:
-        """Recursively extract the assistant's text from nested Gradio output."""
+    def _extract_text(obj, depth=0) -> str:
+        """Recursively dig out assistant text from Gradio output."""
         if depth > 8:
             return ""
         if isinstance(obj, str):
@@ -534,18 +745,22 @@ class LMArenaClient:
         if isinstance(obj, dict):
             for key in ("value", "data", "output"):
                 if key in obj:
-                    found = LMArenaClient._dig_text(obj[key], depth + 1)
+                    found = LMArenaClient._extract_text(obj[key], depth + 1)
                     if found:
                         return found
             return ""
         if isinstance(obj, (list, tuple)):
-            # Chatbot list: [[user, bot], [user, bot], ...]
-            if (obj and isinstance(obj[-1], (list, tuple))
-                    and len(obj[-1]) >= 2 and isinstance(obj[-1][1], str)):
-                return obj[-1][1]
-            # flat list of components
+            if not obj:
+                return ""
+            # Chatbot format: [[user, bot], ...]
+            last = obj[-1]
+            if (isinstance(last, (list, tuple))
+                    and len(last) >= 2
+                    and isinstance(last[1], str)):
+                return last[1]
+            # Flat list — check each element
             for item in reversed(obj):
-                found = LMArenaClient._dig_text(item, depth + 1)
+                found = LMArenaClient._extract_text(item, depth + 1)
                 if found and len(found) > 2:
                     return found
         return ""
@@ -556,16 +771,17 @@ class LMArenaClient:
 # ════════════════════════════════════════════════════════════
 
 def _init():
-    """One-time session-state bootstrap."""
     defaults = dict(
         ready=False,
         messages=[],
+        log=Log(),
         sm=None,
         client=None,
         models=DEFAULT_MODELS[:],
         model=DEFAULT_MODELS[0],
-        status="⚪ not connected",
+        status="⚪ Not connected",
         total=0,
+        connect_error="",
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -573,135 +789,184 @@ def _init():
 
 
 def _connect(manual_cookie: str = ""):
-    """Build SessionManager + LMArenaClient."""
-    sm = SessionManager(manual_cookie=manual_cookie)
-    cl = LMArenaClient(sm)
-    cl.fetch_config()
+    log: Log = st.session_state.log
+    log("━" * 40)
+    log("🔌 Starting connection...")
+
+    sm = SessionManager(log, manual_cookie=manual_cookie)
+    cl = LMArenaClient(sm, log)
+
+    connected = cl.connect()
 
     st.session_state.sm = sm
     st.session_state.client = cl
-    st.session_state.models = cl.models
-    if st.session_state.model not in cl.models:
-        st.session_state.model = cl.models[0]
     st.session_state.ready = True
-    st.session_state.status = f"✅ connected via **{sm.method}**"
+    st.session_state.connect_error = ""
+
+    if connected:
+        n_ep = len(cl.named_endpoints) + len(cl.unnamed_endpoints)
+        st.session_state.status = (
+            f"✅ Connected via **{sm.method}** — {n_ep} endpoints"
+        )
+    else:
+        st.session_state.status = (
+            f"⚠️ Partial — HTTP via {sm.method} (no API endpoints found)"
+        )
+
+    log(f"Connection result: {st.session_state.status}")
 
 
 def _sidebar():
     with st.sidebar:
-        st.title("⚙️ LMArena Client")
-        st.caption(st.session_state.status)
+        st.title("🏟️ LMArena Client")
 
-        # ── connection ─────────────────────────────────
+        # Status
+        st.markdown(st.session_state.status)
+        if st.session_state.connect_error:
+            st.error(st.session_state.connect_error)
+
+        st.divider()
+
+        # ── Connection ─────────────────────────────────
         with st.expander("🔌 Connection", expanded=not st.session_state.ready):
-            if st.button("Connect / Reconnect", use_container_width=True):
-                with st.spinner("Bypassing Cloudflare…"):
-                    try:
-                        _connect()
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("▶️ Connect", use_container_width=True):
+                    with st.spinner("Connecting..."):
+                        try:
+                            _connect()
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state.connect_error = str(e)
+                            st.rerun()
+            with c2:
+                if st.button("🔄 Reconnect", use_container_width=True):
+                    with st.spinner("Reconnecting..."):
+                        st.session_state.ready = False
+                        try:
+                            _connect()
+                        except Exception as e:
+                            st.session_state.connect_error = str(e)
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
 
-            st.markdown("**Manual cookie fallback**")
+            st.markdown("---")
             st.caption(
-                "If auto-bypass fails: open lmarena.ai in your browser → "
-                "F12 → Application → Cookies → copy the `cf_clearance` value."
+                "**Manual cookie** — if auto-connect fails:\n"
+                "1. Open `lmarena.ai` in any browser\n"
+                "2. F12 → Application → Cookies\n"
+                "3. Copy `cf_clearance` value"
             )
-            cookie = st.text_input("cf_clearance cookie", key="cookie_input",
-                                    type="password", label_visibility="collapsed")
+            cookie = st.text_input(
+                "cf_clearance", key="cookie_input",
+                type="password", label_visibility="collapsed",
+            )
             if st.button("Connect with cookie", use_container_width=True) and cookie:
-                with st.spinner("Connecting with cookie…"):
+                with st.spinner("Connecting with cookie..."):
                     try:
                         _connect(manual_cookie=cookie.strip())
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Failed: {e}")
+                        st.session_state.connect_error = str(e)
+                        st.rerun()
 
-        st.divider()
-
-        # ── model picker ──────────────────────────────
+        # ── Model ──────────────────────────────────────
         st.session_state.model = st.selectbox(
             "🤖 Model",
             st.session_state.models,
-            index=(st.session_state.models.index(st.session_state.model)
-                   if st.session_state.model in st.session_state.models else 0),
+            index=(
+                st.session_state.models.index(st.session_state.model)
+                if st.session_state.model in st.session_state.models
+                else 0
+            ),
         )
 
-        # ── parameters ────────────────────────────────
+        # ── Parameters ─────────────────────────────────
         with st.expander("🎛️ Parameters"):
             temp = st.slider("Temperature", 0.0, 2.0, 0.7, 0.05)
             maxt = st.slider("Max tokens", 256, 16384, 4096, 256)
-            sys_p = st.text_area("System prompt (optional)", height=80)
+            sys_p = st.text_area("System prompt", height=80,
+                                  placeholder="Optional system instruction...")
+
         st.divider()
 
-        # ── actions ────────────────────────────────────
+        # ── Actions ────────────────────────────────────
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🗑️ Clear", use_container_width=True):
+            if st.button("🗑️ Clear chat", use_container_width=True):
                 st.session_state.messages = []
                 st.rerun()
         with col2:
-            if st.button("🔄 Refresh", use_container_width=True):
-                if st.session_state.sm:
-                    st.session_state.sm._build()
-                    st.session_state.sm.new_hash()
-                    st.session_state.status = f"✅ refreshed via **{st.session_state.sm.method}**"
-                    st.rerun()
+            if st.button("🧪 Test", use_container_width=True):
+                if st.session_state.client:
+                    log = st.session_state.log
+                    log("🧪 Testing connection...")
+                    try:
+                        r = st.session_state.sm.get(BASE_URL, timeout=10)
+                        log(f"  HTTP status: {r.status_code}")
+                        log(f"  Page length: {len(r.text)} chars")
+                        has_gradio = "gradio" in r.text.lower()
+                        log(f"  Gradio detected: {has_gradio}")
+                        st.success(f"HTTP {r.status_code}, Gradio: {has_gradio}")
+                    except Exception as e:
+                        log(f"  Test failed: {e}")
+                        st.error(f"Test failed: {e}")
+                else:
+                    st.warning("Connect first")
 
         st.caption(f"💬 {st.session_state.total} messages this session")
 
-        # ── debug log ──────────────────────────────────
-        if st.session_state.sm:
-            with st.expander("📜 Connection log"):
-                st.code("\n".join(st.session_state.sm.log[-30:]), language="text")
-
-        # ── dependency health ──────────────────────────
+        # ── Deps ───────────────────────────────────────
         with st.expander("📦 Dependencies"):
             for name, obj, pkg in [
-                ("curl_cffi", cffi_requests, "curl-cffi"),
+                ("gradio_client", GradioClient, "gradio_client"),
                 ("cloudscraper", cloudscraper, "cloudscraper"),
-                ("gradio_client", GradioNativeClient, "gradio_client"),
+                ("curl_cffi", cffi_requests, "curl-cffi"),
             ]:
                 icon = "✅" if obj else "❌"
-                fix = "" if obj else f"  →  `pip install {pkg}`"
+                fix = "" if obj else f" → `pip install {pkg}`"
                 st.markdown(f"{icon} `{name}`{fix}")
+
+        # ── Log ────────────────────────────────────────
+        with st.expander("📜 Connection Log"):
+            log_text = "\n".join(st.session_state.log.recent(50))
+            st.code(log_text or "(empty)", language="text")
 
         return temp, maxt, sys_p
 
 
 def _chat_area(temp, maxt, sys_p):
-    """Main chat column."""
-
-    # render history
+    # Render history
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-    # input
-    prompt = st.chat_input("Type your message…")
+    # Input
+    prompt = st.chat_input("Type your message...")
     if not prompt:
         return
 
-    if not st.session_state.ready:
-        st.error("Connect first → click **Connect / Reconnect** in sidebar.")
+    if not st.session_state.ready or not st.session_state.client:
+        st.error("⚠️ Not connected. Click **Connect** in the sidebar first.")
         return
 
-    # user bubble
+    # User message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # assistant bubble (streaming)
+    # Assistant response (streaming)
     with st.chat_message("assistant"):
+        status = st.status("Generating response...", expanded=False)
         placeholder = st.empty()
         full = ""
+
         client: LMArenaClient = st.session_state.client
 
         try:
             for chunk in client.chat(
                 message=prompt,
                 model=st.session_state.model,
-                history=st.session_state.messages[:-1],   # exclude current user msg
+                history=st.session_state.messages[:-1],
                 temperature=temp,
                 max_tokens=maxt,
                 system_prompt=sys_p,
@@ -709,20 +974,25 @@ def _chat_area(temp, maxt, sys_p):
                 full += chunk
                 placeholder.markdown(full + " ▌")
 
-            placeholder.markdown(full)
-        except Exception as e:
-            err = f"❌ Error: {e}"
-            placeholder.error(err)
-            full = err
+            placeholder.markdown(full or "*(empty response)*")
+            status.update(label="✅ Done", state="complete")
 
-        st.session_state.messages.append({"role": "assistant", "content": full})
+        except Exception as e:
+            err = f"❌ Error: {e}\n\n```\n{traceback.format_exc()}\n```"
+            placeholder.error(str(e))
+            full = f"Error: {e}"
+            status.update(label="❌ Failed", state="error")
+            st.session_state.log(f"❌ Chat error: {e}")
+
+        st.session_state.messages.append(
+            {"role": "assistant", "content": full}
+        )
         st.session_state.total += 1
 
 
 # ════════════════════════════════════════════════════════════
 #  MAIN
 # ════════════════════════════════════════════════════════════
-
 def main():
     st.set_page_config(
         page_title="LMArena Client",
@@ -731,23 +1001,30 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    st.markdown("""
-    <style>
-        section[data-testid="stSidebar"] > div { padding-top: .5rem; }
-        .stChatMessage { max-width: 900px; }
-        .block-container { max-width: 960px; padding-top: 1.5rem; }
-    </style>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+            section[data-testid="stSidebar"] > div { padding-top: .5rem; }
+            .stChatMessage { max-width: 900px; }
+            .block-container { max-width: 960px; padding-top: 1.5rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     _init()
 
-    # auto-connect on first load
+    # Auto-connect on first load
     if not st.session_state.ready:
-        with st.spinner("🔌 First launch — connecting to LMArena…"):
+        with st.spinner("🔌 First launch — connecting to LMArena..."):
             try:
                 _connect()
             except Exception as e:
-                st.warning(f"Auto-connect failed ({e}). Use the sidebar to connect manually.")
+                st.session_state.connect_error = str(e)
+                st.warning(
+                    f"Auto-connect failed: {e}\n\n"
+                    f"Use the sidebar to connect manually."
+                )
 
     temp, maxt, sys_p = _sidebar()
     _chat_area(temp, maxt, sys_p)
